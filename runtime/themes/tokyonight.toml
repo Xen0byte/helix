@@ -65,6 +65,8 @@ hint = { fg = "hint" }
 "diagnostic.warning" = { underline = { style = "curl", color = "yellow"} }
 "diagnostic.info" = { underline = { style = "curl", color = "info"} }
 "diagnostic.hint" = { underline = { style = "curl", color = "hint" } }
+"diagnostic.unnecessary" = { modifiers = ["dim"] }
+"diagnostic.deprecated" = { modifiers = ["crossed_out"] }
 
 "ui.background" = { bg = "bg", fg = "fg" }
 "ui.cursor" = { modifiers = ["reversed"] }
@@ -87,9 +89,11 @@ hint = { fg = "hint" }
 "ui.text.focus" = { bg = "bg-focus" }
 "ui.text.inactive" = { fg = "comment", modifiers = ["italic"] }
 "ui.text.info" = { bg = "bg-menu", fg = "fg" }
+"ui.text.directory" = { fg = "cyan" }
 "ui.virtual.ruler" = { bg = "fg-gutter" }
 "ui.virtual.whitespace" = { fg = "fg-gutter" }
 "ui.virtual.inlay-hint" = {  bg = "bg-inlay", fg = "teal" }
+"ui.virtual.jump-label" = {  fg = "orange", modifiers = ["bold"] }
 "ui.window" = { fg = "border", modifiers = ["bold"] }
 
 [palette]

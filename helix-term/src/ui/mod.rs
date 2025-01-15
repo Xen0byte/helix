@@ -12,16 +12,17 @@ mod prompt;
 mod spinner;
 mod statusline;
 mod text;
+mod text_decorations;
 
-use crate::compositor::{Component, Compositor};
+use crate::compositor::Compositor;
 use crate::filter_picker_entry;
 use crate::job::{self, Callback};
-pub use completion::{Completion, CompletionItem};
+pub use completion::Completion;
 pub use editor::EditorView;
 use helix_stdx::rope;
 pub use markdown::Markdown;
 pub use menu::Menu;
-pub use picker::{DynamicPicker, FileLocation, Picker};
+pub use picker::{Column as PickerColumn, FileLocation, Picker};
 pub use popup::Popup;
 pub use prompt::{Prompt, PromptEvent};
 pub use spinner::{ProgressSpinners, Spinner};
@@ -29,7 +30,18 @@ pub use text::Text;
 
 use helix_view::Editor;
 
-use std::path::PathBuf;
+use std::{error::Error, path::PathBuf};
+
+struct Utf8PathBuf {
+    path: String,
+    is_dir: bool,
+}
+
+impl AsRef<str> for Utf8PathBuf {
+    fn as_ref(&self) -> &str {
+        &self.path
+    }
+}
 
 pub fn prompt(
     cx: &mut crate::commands::Context,
@@ -82,7 +94,7 @@ pub fn raw_regex_prompt(
     let (view, doc) = current!(cx.editor);
     let doc_id = view.doc;
     let snapshot = doc.selection(view.id).clone();
-    let offset_snapshot = view.offset;
+    let offset_snapshot = doc.view_offset(view.id);
     let config = cx.editor.config();
 
     let mut prompt = Prompt::new(
@@ -94,7 +106,7 @@ pub fn raw_regex_prompt(
                 PromptEvent::Abort => {
                     let (view, doc) = current!(cx.editor);
                     doc.set_selection(view.id, snapshot.clone());
-                    view.offset = offset_snapshot;
+                    doc.set_view_offset(view.id, offset_snapshot);
                 }
                 PromptEvent::Update | PromptEvent::Validate => {
                     // skip empty input
@@ -135,7 +147,7 @@ pub fn raw_regex_prompt(
                         Err(err) => {
                             let (view, doc) = current!(cx.editor);
                             doc.set_selection(view.id, snapshot.clone());
-                            view.offset = offset_snapshot;
+                            doc.set_view_offset(view.id, offset_snapshot);
 
                             if event == PromptEvent::Validate {
                                 let callback = async move {
@@ -143,14 +155,12 @@ pub fn raw_regex_prompt(
                                         move |_editor: &mut Editor, compositor: &mut Compositor| {
                                             let contents = Text::new(format!("{}", err));
                                             let size = compositor.size();
-                                            let mut popup = Popup::new("invalid-regex", contents)
+                                            let popup = Popup::new("invalid-regex", contents)
                                                 .position(Some(helix_core::Position::new(
                                                     size.height as usize - 2, // 2 = statusline + commandline
                                                     0,
                                                 )))
                                                 .auto_close(true);
-                                            popup.required_size((size.width, size.height));
-
                                             compositor.replace_or_push("invalid-regex", popup);
                                         },
                                     ));
@@ -172,7 +182,9 @@ pub fn raw_regex_prompt(
     cx.push_layer(Box::new(prompt));
 }
 
-pub fn file_picker(root: PathBuf, config: &helix_view::editor::Config) -> Picker<PathBuf> {
+type FilePicker = Picker<PathBuf, PathBuf>;
+
+pub fn file_picker(root: PathBuf, config: &helix_view::editor::Config) -> FilePicker {
     use ignore::{types::TypesBuilder, WalkBuilder};
     use std::time::Instant;
 
@@ -219,7 +231,16 @@ pub fn file_picker(root: PathBuf, config: &helix_view::editor::Config) -> Picker
     });
     log::debug!("file_picker init {:?}", Instant::now().duration_since(now));
 
-    let picker = Picker::new(Vec::new(), root, move |cx, path: &PathBuf, action| {
+    let columns = [PickerColumn::new(
+        "path",
+        |item: &PathBuf, root: &PathBuf| {
+            item.strip_prefix(root)
+                .unwrap_or(item)
+                .to_string_lossy()
+                .into()
+        },
+    )];
+    let picker = Picker::new(columns, 0, [], root, move |cx, path: &PathBuf, action| {
         if let Err(e) = cx.editor.open(path, action) {
             let err = if let Some(err) = e.source() {
                 format!("{}", err)
@@ -229,7 +250,7 @@ pub fn file_picker(root: PathBuf, config: &helix_view::editor::Config) -> Picker
             cx.editor.set_error(err);
         }
     })
-    .with_preview(|_editor, path| Some((path.clone().into(), None)));
+    .with_preview(|_editor, path| Some((path.as_path().into(), None)));
     let injector = picker.injector();
     let timeout = std::time::Instant::now() + std::time::Duration::from_millis(30);
 
@@ -256,6 +277,7 @@ pub fn file_picker(root: PathBuf, config: &helix_view::editor::Config) -> Picker
 }
 
 pub mod completers {
+    use super::Utf8PathBuf;
     use crate::ui::prompt::Completion;
     use helix_core::fuzzy::fuzzy_match;
     use helix_core::syntax::LanguageServerFeature;
@@ -264,6 +286,7 @@ pub mod completers {
     use helix_view::{editor::Config, Editor};
     use once_cell::sync::Lazy;
     use std::borrow::Cow;
+    use tui::text::Span;
 
     pub type Completer = fn(&Editor, &str) -> Vec<Completion>;
 
@@ -280,7 +303,7 @@ pub mod completers {
 
         fuzzy_match(input, names, true)
             .into_iter()
-            .map(|(name, _)| ((0..), name))
+            .map(|(name, _)| ((0..), name.into()))
             .collect()
     }
 
@@ -326,7 +349,7 @@ pub mod completers {
 
         fuzzy_match(input, &*KEYS, false)
             .into_iter()
-            .map(|(name, _)| ((0..), name.into()))
+            .map(|(name, _)| ((0..), Span::raw(name)))
             .collect()
     }
 
@@ -366,14 +389,16 @@ pub mod completers {
     }
 
     pub fn lsp_workspace_command(editor: &Editor, input: &str) -> Vec<Completion> {
-        let Some(options) = doc!(editor)
+        let commands = doc!(editor)
             .language_servers_with_feature(LanguageServerFeature::WorkspaceCommand)
-            .find_map(|ls| ls.capabilities().execute_command_provider.as_ref())
-        else {
-            return vec![];
-        };
+            .flat_map(|ls| {
+                ls.capabilities()
+                    .execute_command_provider
+                    .iter()
+                    .flat_map(|options| options.commands.iter())
+            });
 
-        fuzzy_match(input, &options.commands, false)
+        fuzzy_match(input, commands, false)
             .into_iter()
             .map(|(name, _)| ((0..), name.to_owned().into()))
             .collect()
@@ -412,7 +437,7 @@ pub mod completers {
 
     // TODO: we could return an iter/lazy thing so it can fetch as many as it needs.
     fn filename_impl<F>(
-        _editor: &Editor,
+        editor: &Editor,
         input: &str,
         git_ignore: bool,
         filter_fn: F,
@@ -470,7 +495,7 @@ pub mod completers {
                         return None;
                     }
 
-                    //let is_dir = entry.file_type().map_or(false, |entry| entry.is_dir());
+                    let is_dir = entry.file_type().is_some_and(|entry| entry.is_dir());
 
                     let path = entry.path();
                     let mut path = if is_tilde {
@@ -489,24 +514,50 @@ pub mod completers {
                     }
 
                     let path = path.into_os_string().into_string().ok()?;
-                    Some(Cow::from(path))
+                    Some(Utf8PathBuf { path, is_dir })
                 })
             }) // TODO: unwrap or skip
-            .filter(|path| !path.is_empty());
+            .filter(|path| !path.path.is_empty());
+
+        let directory_color = editor.theme.get("ui.text.directory");
+
+        let style_from_file = |file: Utf8PathBuf| {
+            if file.is_dir {
+                Span::styled(file.path, directory_color)
+            } else {
+                Span::raw(file.path)
+            }
+        };
 
         // if empty, return a list of dirs and files in current dir
         if let Some(file_name) = file_name {
             let range = (input.len().saturating_sub(file_name.len()))..;
             fuzzy_match(&file_name, files, true)
                 .into_iter()
-                .map(|(name, _)| (range.clone(), name))
+                .map(|(name, _)| (range.clone(), style_from_file(name)))
                 .collect()
 
             // TODO: complete to longest common match
         } else {
-            let mut files: Vec<_> = files.map(|file| (end.clone(), file)).collect();
-            files.sort_unstable_by(|(_, path1), (_, path2)| path1.cmp(path2));
+            let mut files: Vec<_> = files
+                .map(|file| (end.clone(), style_from_file(file)))
+                .collect();
+            files.sort_unstable_by(|(_, path1), (_, path2)| path1.content.cmp(&path2.content));
             files
         }
+    }
+
+    pub fn register(editor: &Editor, input: &str) -> Vec<Completion> {
+        let iter = editor
+            .registers
+            .iter_preview()
+            // Exclude special registers that shouldn't be written to
+            .filter(|(ch, _)| !matches!(ch, '%' | '#' | '.'))
+            .map(|(ch, _)| ch.to_string());
+
+        fuzzy_match(input, iter, false)
+            .into_iter()
+            .map(|(name, _)| ((0..), name.into()))
+            .collect()
     }
 }

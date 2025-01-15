@@ -1,3 +1,5 @@
+mod tree_cursor;
+
 use crate::{
     auto_pairs::AutoPairs,
     chars::char_is_line_ending,
@@ -19,7 +21,7 @@ use std::{
     borrow::Cow,
     cell::RefCell,
     collections::{HashMap, HashSet, VecDeque},
-    fmt::{self, Display},
+    fmt::{self, Display, Write},
     hash::{Hash, Hasher},
     mem::replace,
     path::{Path, PathBuf},
@@ -31,6 +33,8 @@ use once_cell::sync::{Lazy, OnceCell};
 use serde::{ser::SerializeSeq, Deserialize, Serialize};
 
 use helix_loader::grammar::{get_language, load_runtime_file};
+
+pub use tree_cursor::TreeCursor;
 
 fn deserialize_regex<'de, D>(deserializer: D) -> Result<Option<Regex>, D::Error>
 where
@@ -120,6 +124,9 @@ pub struct LanguageConfiguration {
 
     #[serde(skip_serializing_if = "Option::is_none")]
     pub formatter: Option<FormatterConfiguration>,
+
+    /// If set, overrides `editor.path-completion`.
+    pub path_completion: Option<bool>,
 
     #[serde(default)]
     pub diagnostic_severity: Severity,
@@ -506,6 +513,7 @@ pub enum DebugArgumentValue {
 pub struct DebugTemplate {
     pub name: String,
     pub request: String,
+    #[serde(default)]
     pub completion: Vec<DebugConfigCompletion>,
     pub args: HashMap<String, DebugArgumentValue>,
 }
@@ -611,7 +619,7 @@ pub enum CapturedNode<'a> {
     Grouped(Vec<Node<'a>>),
 }
 
-impl<'a> CapturedNode<'a> {
+impl CapturedNode<'_> {
     pub fn start_byte(&self) -> usize {
         match self {
             Self::Single(n) => n.start_byte(),
@@ -724,8 +732,11 @@ pub fn read_query(language: &str, filename: &str) -> String {
         .replace_all(&query, |captures: &regex::Captures| {
             captures[1]
                 .split(',')
-                .map(|language| format!("\n{}\n", read_query(language, filename)))
-                .collect::<String>()
+                .fold(String::new(), |mut output, language| {
+                    // `write!` to a String cannot fail.
+                    write!(output, "\n{}\n", read_query(language, filename)).unwrap();
+                    output
+                })
         })
         .to_string()
 }
@@ -1017,9 +1028,10 @@ impl Loader {
         match capture {
             InjectionLanguageMarker::Name(string) => self.language_config_for_name(string),
             InjectionLanguageMarker::Filename(file) => self.language_config_for_file_name(file),
-            InjectionLanguageMarker::Shebang(shebang) => {
-                self.language_config_for_language_id(shebang)
-            }
+            InjectionLanguageMarker::Shebang(shebang) => self
+                .language_config_ids_by_shebang
+                .get(shebang)
+                .and_then(|&id| self.language_configs.get(id).cloned()),
         }
     }
 
@@ -1090,6 +1102,7 @@ impl Syntax {
                 start_point: Point::new(0, 0),
                 end_point: Point::new(usize::MAX, usize::MAX),
             }],
+            parent: None,
         };
 
         // track scope_descriptor: a Vec of scopes for item in tree
@@ -1239,7 +1252,7 @@ impl Syntax {
         PARSER.with(|ts_parser| {
             let ts_parser = &mut ts_parser.borrow_mut();
             ts_parser.parser.set_timeout_micros(1000 * 500); // half a second is pretty generours
-            let mut cursor = ts_parser.cursors.pop().unwrap_or_else(QueryCursor::new);
+            let mut cursor = ts_parser.cursors.pop().unwrap_or_default();
             // TODO: might need to set cursor range
             cursor.set_byte_range(0..usize::MAX);
             cursor.set_match_limit(TREE_SITTER_MATCH_LIMIT);
@@ -1354,12 +1367,14 @@ impl Syntax {
                 let depth = layer.depth + 1;
                 // TODO: can't inline this since matches borrows self.layers
                 for (config, ranges) in injections {
+                    let parent = Some(layer_id);
                     let new_layer = LanguageLayer {
                         tree: None,
                         config,
                         depth,
                         ranges,
                         flags: LayerUpdateFlags::empty(),
+                        parent: None,
                     };
 
                     // Find an identical existing layer
@@ -1371,6 +1386,7 @@ impl Syntax {
 
                     // ...or insert a new one.
                     let layer_id = layer.unwrap_or_else(|| self.layers.insert(new_layer));
+                    self.layers[layer_id].parent = parent;
 
                     queue.push_back(layer_id);
                 }
@@ -1412,14 +1428,17 @@ impl Syntax {
                 // Reuse a cursor from the pool if available.
                 let mut cursor = PARSER.with(|ts_parser| {
                     let highlighter = &mut ts_parser.borrow_mut();
-                    highlighter.cursors.pop().unwrap_or_else(QueryCursor::new)
+                    highlighter.cursors.pop().unwrap_or_default()
                 });
 
                 // The `captures` iterator borrows the `Tree` and the `QueryCursor`, which
                 // prevents them from being moved. But both of these values are really just
                 // pointers, so it's actually ok to move them.
-                let cursor_ref =
-                    unsafe { mem::transmute::<_, &'static mut QueryCursor>(&mut cursor) };
+                let cursor_ref = unsafe {
+                    mem::transmute::<&mut tree_sitter::QueryCursor, &mut tree_sitter::QueryCursor>(
+                        &mut cursor,
+                    )
+                };
 
                 // if reusing cursors & no range this resets to whole range
                 cursor_ref.set_byte_range(range.clone().unwrap_or(0..usize::MAX));
@@ -1493,6 +1512,12 @@ impl Syntax {
             .descendant_for_byte_range(start, end)
     }
 
+    pub fn walk(&self) -> TreeCursor<'_> {
+        // data structure to find the smallest range that contains a point
+        // when some of the ranges in the structure can overlap.
+        TreeCursor::new(&self.layers, self.root)
+    }
+
     // Commenting
     // comment_strings_for_pos
     // is_commented
@@ -1525,6 +1550,7 @@ pub struct LanguageLayer {
     pub ranges: Vec<Range>,
     pub depth: u32,
     flags: LayerUpdateFlags,
+    parent: Option<LayerId>,
 }
 
 /// This PartialEq implementation only checks if that
@@ -1717,10 +1743,10 @@ pub(crate) fn generate_edits(
 }
 
 use std::sync::atomic::{AtomicUsize, Ordering};
-use std::{iter, mem, ops, str, usize};
+use std::{iter, mem, ops, str};
 use tree_sitter::{
     Language as Grammar, Node, Parser, Point, Query, QueryCaptures, QueryCursor, QueryError,
-    QueryMatch, Range, TextProvider, Tree, TreeCursor,
+    QueryMatch, Range, TextProvider, Tree,
 };
 
 const CANCELLATION_CHECK_INTERVAL: usize = 100;
@@ -1826,7 +1852,7 @@ struct HighlightIterLayer<'a> {
     depth: u32,
 }
 
-impl<'a> fmt::Debug for HighlightIterLayer<'a> {
+impl fmt::Debug for HighlightIterLayer<'_> {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.debug_struct("HighlightIterLayer").finish()
     }
@@ -2083,7 +2109,7 @@ impl HighlightConfiguration {
     }
 }
 
-impl<'a> HighlightIterLayer<'a> {
+impl HighlightIterLayer<'_> {
     // First, sort scope boundaries by their byte offset in the document. At a
     // given position, emit scope endings before scope beginnings. Finally, emit
     // scope boundaries from deeper layers first.
@@ -2221,7 +2247,7 @@ fn intersect_ranges(
     result
 }
 
-impl<'a> HighlightIter<'a> {
+impl HighlightIter<'_> {
     fn emit_event(
         &mut self,
         offset: usize,
@@ -2276,7 +2302,7 @@ impl<'a> HighlightIter<'a> {
     }
 }
 
-impl<'a> Iterator for HighlightIter<'a> {
+impl Iterator for HighlightIter<'_> {
     type Item = Result<HighlightEvent, Error>;
 
     fn next(&mut self) -> Option<Self::Item> {
@@ -2640,12 +2666,20 @@ fn node_is_visible(node: &Node) -> bool {
     node.is_missing() || (node.is_named() && node.language().node_kind_is_visible(node.kind_id()))
 }
 
+fn format_anonymous_node_kind(kind: &str) -> Cow<str> {
+    if kind.contains('"') {
+        Cow::Owned(kind.replace('"', "\\\""))
+    } else {
+        Cow::Borrowed(kind)
+    }
+}
+
 pub fn pretty_print_tree<W: fmt::Write>(fmt: &mut W, node: Node) -> fmt::Result {
     if node.child_count() == 0 {
         if node_is_visible(&node) {
             write!(fmt, "({})", node.kind())
         } else {
-            write!(fmt, "\"{}\"", node.kind())
+            write!(fmt, "\"{}\"", format_anonymous_node_kind(node.kind()))
         }
     } else {
         pretty_print_tree_impl(fmt, &mut node.walk(), 0)
@@ -2654,7 +2688,7 @@ pub fn pretty_print_tree<W: fmt::Write>(fmt: &mut W, node: Node) -> fmt::Result 
 
 fn pretty_print_tree_impl<W: fmt::Write>(
     fmt: &mut W,
-    cursor: &mut TreeCursor,
+    cursor: &mut tree_sitter::TreeCursor,
     depth: usize,
 ) -> fmt::Result {
     let node = cursor.node();
@@ -2669,6 +2703,8 @@ fn pretty_print_tree_impl<W: fmt::Write>(
         }
 
         write!(fmt, "({}", node.kind())?;
+    } else {
+        write!(fmt, " \"{}\"", format_anonymous_node_kind(node.kind()))?;
     }
 
     // Handle children.
@@ -2752,10 +2788,10 @@ mod test {
             )
         };
 
-        test("quantified_nodes", 1..36);
+        test("quantified_nodes", 1..37);
         // NOTE: Enable after implementing proper node group capturing
-        // test("quantified_nodes_grouped", 1..36);
-        // test("multiple_nodes_grouped", 1..36);
+        // test("quantified_nodes_grouped", 1..37);
+        // test("multiple_nodes_grouped", 1..37);
     }
 
     #[test]
@@ -2926,8 +2962,8 @@ mod test {
 
     #[test]
     fn test_pretty_print() {
-        let source = r#"/// Hello"#;
-        assert_pretty_print("rust", source, "(line_comment)", 0, source.len());
+        let source = r#"// Hello"#;
+        assert_pretty_print("rust", source, "(line_comment \"//\")", 0, source.len());
 
         // A large tree should be indented with fields:
         let source = r#"fn main() {
@@ -2937,15 +2973,16 @@ mod test {
             "rust",
             source,
             concat!(
-                "(function_item\n",
+                "(function_item \"fn\"\n",
                 "  name: (identifier)\n",
-                "  parameters: (parameters)\n",
-                "  body: (block\n",
+                "  parameters: (parameters \"(\" \")\")\n",
+                "  body: (block \"{\"\n",
                 "    (expression_statement\n",
                 "      (macro_invocation\n",
-                "        macro: (identifier)\n",
-                "        (token_tree\n",
-                "          (string_literal))))))",
+                "        macro: (identifier) \"!\"\n",
+                "        (token_tree \"(\"\n",
+                "          (string_literal \"\\\"\"\n",
+                "            (string_content) \"\\\"\") \")\")) \";\") \"}\"))",
             ),
             0,
             source.len(),
@@ -2957,14 +2994,14 @@ mod test {
 
         // Error nodes are printed as errors:
         let source = r#"}{"#;
-        assert_pretty_print("rust", source, "(ERROR)", 0, source.len());
+        assert_pretty_print("rust", source, "(ERROR \"}\" \"{\")", 0, source.len());
 
         // Fields broken under unnamed nodes are determined correctly.
         // In the following source, `object` belongs to the `singleton_method`
         // rule but `name` and `body` belong to an unnamed helper `_method_rest`.
         // This can cause a bug with a pretty-printing implementation that
         // uses `Node::field_name_for_child` to determine field names but is
-        // fixed when using `TreeCursor::field_name`.
+        // fixed when using `tree_sitter::TreeCursor::field_name`.
         let source = "def self.method_name
           true
         end";
@@ -2972,11 +3009,11 @@ mod test {
             "ruby",
             source,
             concat!(
-                "(singleton_method\n",
-                "  object: (self)\n",
+                "(singleton_method \"def\"\n",
+                "  object: (self) \".\"\n",
                 "  name: (identifier)\n",
                 "  body: (body_statement\n",
-                "    (true)))"
+                "    (true)) \"end\")"
             ),
             0,
             source.len(),

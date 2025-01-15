@@ -1,4 +1,4 @@
-use std::{borrow::Cow, collections::HashMap};
+use std::{borrow::Cow, collections::HashMap, iter};
 
 use helix_stdx::rope::RopeSliceExt;
 use tree_sitter::{Query, QueryCursor, QueryPredicateArg};
@@ -8,7 +8,7 @@ use crate::{
     graphemes::{grapheme_width, tab_width_at},
     syntax::{IndentationHeuristic, LanguageConfiguration, RopeProvider, Syntax},
     tree_sitter::Node,
-    Position, Rope, RopeGraphemes, RopeSlice,
+    Position, Rope, RopeGraphemes, RopeSlice, Tendril,
 };
 
 /// Enum representing indentation style.
@@ -210,6 +210,36 @@ fn whitespace_with_same_width(text: RopeSlice) -> String {
     s
 }
 
+/// normalizes indentation to tabs/spaces based on user configuration
+/// This function does not change the actual indentation width, just the character
+/// composition.
+pub fn normalize_indentation(
+    prefix: RopeSlice<'_>,
+    line: RopeSlice<'_>,
+    dst: &mut Tendril,
+    indent_style: IndentStyle,
+    tab_width: usize,
+) -> usize {
+    #[allow(deprecated)]
+    let off = crate::visual_coords_at_pos(prefix, prefix.len_chars(), tab_width).col;
+    let mut len = 0;
+    let mut original_len = 0;
+    for ch in line.chars() {
+        match ch {
+            '\t' => len += tab_width_at(len + off, tab_width as u16),
+            ' ' => len += 1,
+            _ => break,
+        }
+        original_len += 1;
+    }
+    if indent_style == IndentStyle::Tabs {
+        dst.extend(iter::repeat('\t').take(len / tab_width));
+        len %= tab_width;
+    }
+    dst.extend(iter::repeat(' ').take(len));
+    original_len
+}
+
 fn add_indent_level(
     mut base_indent: String,
     added_indent_level: isize,
@@ -247,48 +277,25 @@ fn add_indent_level(
     }
 }
 
-/// Computes for node and all ancestors whether they are the first node on their line.
-/// The first entry in the return value represents the root node, the last one the node itself
-fn get_first_in_line(mut node: Node, new_line_byte_pos: Option<usize>) -> Vec<bool> {
-    let mut first_in_line = Vec::new();
-    loop {
-        if let Some(prev) = node.prev_sibling() {
-            // If we insert a new line, the first node at/after the cursor is considered to be the first in its line
-            let first = prev.end_position().row != node.start_position().row
-                || new_line_byte_pos.map_or(false, |byte_pos| {
-                    node.start_byte() >= byte_pos && prev.start_byte() < byte_pos
-                });
-            first_in_line.push(Some(first));
-        } else {
-            // Nodes that have no previous siblings are first in their line if and only if their parent is
-            // (which we don't know yet)
-            first_in_line.push(None);
-        }
-        if let Some(parent) = node.parent() {
-            node = parent;
-        } else {
-            break;
+/// Return true if only whitespace comes before the node on its line.
+/// If given, new_line_byte_pos is treated the same way as any existing newline.
+fn is_first_in_line(node: Node, text: RopeSlice, new_line_byte_pos: Option<usize>) -> bool {
+    let mut line_start_byte_pos = text.line_to_byte(node.start_position().row);
+    if let Some(pos) = new_line_byte_pos {
+        if line_start_byte_pos < pos && pos <= node.start_byte() {
+            line_start_byte_pos = pos;
         }
     }
-
-    let mut result = Vec::with_capacity(first_in_line.len());
-    let mut parent_is_first = true; // The root node is by definition the first node in its line
-    for first in first_in_line.into_iter().rev() {
-        if let Some(first) = first {
-            result.push(first);
-            parent_is_first = first;
-        } else {
-            result.push(parent_is_first);
-        }
-    }
-    result
+    text.byte_slice(line_start_byte_pos..node.start_byte())
+        .chars()
+        .all(|c| c.is_whitespace())
 }
 
 /// The total indent for some line of code.
 /// This is usually constructed in one of 2 ways:
 /// - Successively add indent captures to get the (added) indent from a single line
 /// - Successively add the indent results for each line
-/// The string that this indentation defines starts with the string contained in the align field (unless it is None), followed by:
+///   The string that this indentation defines starts with the string contained in the align field (unless it is None), followed by:
 /// - max(0, indent - outdent) tabs, if tabs are used for indentation
 /// - max(0, indent - outdent)*indent_width spaces, if spaces are used for indentation
 #[derive(Default, Debug, PartialEq, Eq, Clone)]
@@ -409,7 +416,7 @@ enum IndentCaptureType<'a> {
     Align(RopeSlice<'a>),
 }
 
-impl<'a> IndentCaptureType<'a> {
+impl IndentCaptureType<'_> {
     fn default_scope(&self) -> IndentScope {
         match self {
             IndentCaptureType::Indent | IndentCaptureType::IndentAlways => IndentScope::Tail,
@@ -480,7 +487,7 @@ fn query_indents<'a>(
         // Skip matches where not all custom predicates are fulfilled
         if !query.general_predicates(m.pattern_index).iter().all(|pred| {
             match pred.operator.as_ref() {
-                "not-kind-eq?" => match (pred.args.get(0), pred.args.get(1)) {
+                "not-kind-eq?" => match (pred.args.first(), pred.args.get(1)) {
                     (
                         Some(QueryPredicateArg::Capture(capture_idx)),
                         Some(QueryPredicateArg::String(kind)),
@@ -496,7 +503,7 @@ fn query_indents<'a>(
                     }
                 },
                 "same-line?" | "not-same-line?" => {
-                    match (pred.args.get(0), pred.args.get(1)) {
+                    match (pred.args.first(), pred.args.get(1)) {
                         (
                             Some(QueryPredicateArg::Capture(capt1)),
                             Some(QueryPredicateArg::Capture(capt2))
@@ -518,7 +525,7 @@ fn query_indents<'a>(
                         }
                     }
                 }
-                "one-line?" | "not-one-line?" => match pred.args.get(0) {
+                "one-line?" | "not-one-line?" => match pred.args.first() {
                     Some(QueryPredicateArg::Capture(capture_idx)) => {
                         let node = m.nodes_for_capture_index(*capture_idx).next();
 
@@ -763,7 +770,7 @@ fn init_indent_query<'a, 'b>(
 
         crate::syntax::PARSER.with(|ts_parser| {
             let mut ts_parser = ts_parser.borrow_mut();
-            let mut cursor = ts_parser.cursors.pop().unwrap_or_else(QueryCursor::new);
+            let mut cursor = ts_parser.cursors.pop().unwrap_or_default();
             let query_result = query_indents(
                 query,
                 syntax,
@@ -809,6 +816,7 @@ fn init_indent_query<'a, 'b>(
 /// - The line after the node. This is defined by:
 ///   - The scope `tail`.
 ///   - The scope `all` if this node is not the first node on its line.
+///
 /// Intuitively, `all` applies to everything contained in this node while `tail` applies to everything except for the first line of the node.
 /// The indents from different nodes for the same line are then combined.
 /// The result [Indentation] is simply the sum of the [Indentation] for all lines.
@@ -852,7 +860,6 @@ pub fn treesitter_indent_for_pos<'a>(
         byte_pos,
         new_line_byte_pos,
     )?;
-    let mut first_in_line = get_first_in_line(node, new_line.then_some(byte_pos));
 
     let mut result = Indentation::default();
     // We always keep track of all the indent changes on one line, in order to only indent once
@@ -861,9 +868,7 @@ pub fn treesitter_indent_for_pos<'a>(
     let mut indent_for_line_below = Indentation::default();
 
     loop {
-        // This can safely be unwrapped because `first_in_line` contains
-        // one entry for each ancestor of the node (which is what we iterate over)
-        let is_first = *first_in_line.last().unwrap();
+        let is_first = is_first_in_line(node, text, new_line_byte_pos);
 
         // Apply all indent definitions for this node.
         // Since we only iterate over each node once, we can remove the
@@ -906,7 +911,6 @@ pub fn treesitter_indent_for_pos<'a>(
             }
 
             node = parent;
-            first_in_line.pop();
         } else {
             // Only add the indentation for the line below if that line
             // is not after the line that the indentation is calculated for.

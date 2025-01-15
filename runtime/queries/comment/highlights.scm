@@ -1,5 +1,3 @@
-":" @punctuation.delimiter
-
 ; Hint level tags
 ((tag (name) @hint)
  (#match? @hint "^(HINT|MARK|PASSED|STUB|MOCK)$"))
@@ -23,10 +21,10 @@
 
 ; Error level tags
 ((tag (name) @error)
- (#match? @error "^(BUG|FIXME|ISSUE|XXX|FIX|SAFETY|FIXIT|FAILED|DEBUG)$"))
+ (#match? @error "^(BUG|FIXME|ISSUE|XXX|FIX|SAFETY|FIXIT|FAILED|DEBUG|INVARIANT|COMPLIANCE)$"))
 
 ("text" @error
- (#match? @error "^(BUG|FIXME|ISSUE|XXX|FIX|SAFETY|FIXIT|FAILED|DEBUG)$"))
+ (#match? @error "^(BUG|FIXME|ISSUE|XXX|FIX|SAFETY|FIXIT|FAILED|DEBUG|INVARIANT|COMPLIANCE)$"))
 
 (tag
  (name) @ui.text

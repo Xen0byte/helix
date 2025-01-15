@@ -51,9 +51,66 @@
 (lifetime
   "'" @label
   (identifier) @label)
-(loop_label
+(label
   "'" @label
   (identifier) @label)
+
+; ---
+; Prelude
+; ---
+
+((identifier) @type.enum.variant.builtin
+ (#any-of? @type.enum.variant.builtin "Some" "None" "Ok" "Err"))
+
+
+(call_expression
+  (identifier) @function.builtin
+  (#any-of? @function.builtin
+    "drop"
+    "size_of"
+    "size_of_val"
+    "align_of"
+    "align_of_val"))
+
+((type_identifier) @type.builtin
+ (#any-of?
+    @type.builtin
+    "Send"
+    "Sized"
+    "Sync"
+    "Unpin"
+    "Drop"
+    "Fn"
+    "FnMut"
+    "FnOnce"
+    "AsMut"
+    "AsRef"
+    "From"
+    "Into"
+    "DoubleEndedIterator"
+    "ExactSizeIterator"
+    "Extend"
+    "IntoIterator"
+    "Iterator"
+    "Option"
+    "Result"
+    "Clone"
+    "Copy"
+    "Debug"
+    "Default"
+    "Eq"
+    "Hash"
+    "Ord"
+    "PartialEq"
+    "PartialOrd"
+    "ToOwned"
+    "Box"
+    "String"
+    "ToString"
+    "Vec"
+    "FromIterator"
+    "TryFrom"
+    "TryInto"))
 
 ; ---
 ; Punctuation
@@ -64,6 +121,7 @@
   "."
   ";"
   ","
+  ":"
 ] @punctuation.delimiter
 
 [
@@ -125,6 +183,7 @@
   "match"
   "if"
   "else"
+  "try"
 ] @keyword.control.conditional
 
 [
@@ -260,6 +319,8 @@
 ((identifier) @type
   (#match? @type "^[A-Z]"))
 
+(never_type "!" @type)
+
 ; -------
 ; Functions
 ; -------
@@ -376,7 +437,8 @@
 (use_wildcard
   (identifier) @namespace)
 (extern_crate_declaration
-  name: (identifier) @namespace)
+  name: (identifier) @namespace
+  alias: (identifier)? @namespace)
 (mod_item
   name: (identifier) @namespace)
 (scoped_use_list
@@ -401,6 +463,7 @@
 ; Remaining Identifiers
 ; -------
 
+; We do not style ? as an operator on purpose as it allows styling ? differently, as many highlighters do. @operator.special might have been a better scope, but @special is already documented so the change would break themes (including the intent of the default theme)
 "?" @special
 
 (type_identifier) @type

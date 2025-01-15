@@ -1,4 +1,4 @@
-# Adding new languages to Helix
+## Adding new languages to Helix
 
 In order to add a new language to Helix, you will need to follow the steps
 below.
@@ -16,7 +16,7 @@ below.
 
 > 💡 If you are adding a new Language Server configuration, make sure to update
 > the
-> [Language Server Wiki](https://github.com/helix-editor/helix/wiki/How-to-install-the-default-language-servers)
+> [Language Server Wiki](https://github.com/helix-editor/helix/wiki/Language-Server-Configurations)
 > with the installation instructions.
 
 ## Grammar configuration
@@ -34,7 +34,7 @@ below.
 2. Create a new directory for the language with the path
    `runtime/queries/<name>/`.
 3. Refer to the
-   [tree-sitter website](https://tree-sitter.github.io/tree-sitter/syntax-highlighting#queries)
+   [tree-sitter website](https://tree-sitter.github.io/tree-sitter/3-syntax-highlighting.html#highlights)
    for more information on writing queries.
 4. A list of highlight captures can be found [on the themes page](https://docs.helix-editor.com/themes.html#scopes).
 
